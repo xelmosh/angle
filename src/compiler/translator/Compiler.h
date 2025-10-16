@@ -137,6 +137,7 @@ class TCompiler : public TShHandleBase
     }
 
     ShHashFunction64 getHashFunction() const { return mResources.HashFunction; }
+    char getUserVariableNamePrefix() const { return mResources.UserVariableNamePrefix; }
     NameMap &getNameMap() { return mNameMap; }
     TSymbolTable &getSymbolTable() { return mSymbolTable; }
     ShShaderSpec getShaderSpec() const { return mShaderSpec; }
@@ -296,10 +297,10 @@ class TCompiler : public TShHandleBase
     bool limitExpressionComplexity(TIntermBlock *root);
     // Creates the function call DAG for further analysis, returning false if there is a recursion
     bool initCallDag(TIntermNode *root);
-    // Return false if "main" doesn't exist
-    bool tagUsedFunctions();
+    void tagUsedFunctions();
     void internalTagUsedFunction(size_t index);
 
+    void collectVariables(TIntermBlock *root);
     void collectInterfaceBlocks();
 
     bool sortUniforms(TIntermBlock *root);
@@ -326,8 +327,6 @@ class TCompiler : public TShHandleBase
     bool checkAndSimplifyAST(TIntermBlock *root,
                              const TParseContext &parseContext,
                              const ShCompileOptions &compileOptions);
-
-    bool postParseChecks(const TParseContext &parseContext);
 
     sh::GLenum mShaderType;
     ShShaderSpec mShaderSpec;

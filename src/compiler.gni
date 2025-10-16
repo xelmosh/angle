@@ -84,6 +84,8 @@ angle_translator_sources = [
   "src/compiler/translator/Severity.h",
   "src/compiler/translator/ShaderLang.cpp",
   "src/compiler/translator/ShaderVars.cpp",
+  "src/compiler/translator/SizeClipCullDistance.cpp",
+  "src/compiler/translator/SizeClipCullDistance.h",
   "src/compiler/translator/StaticType.h",
   "src/compiler/translator/Symbol.cpp",
   "src/compiler/translator/Symbol.h",
@@ -96,16 +98,8 @@ angle_translator_sources = [
   "src/compiler/translator/Types.h",
   "src/compiler/translator/ValidateAST.cpp",
   "src/compiler/translator/ValidateAST.h",
-  "src/compiler/translator/ValidateBarrierFunctionCall.cpp",
-  "src/compiler/translator/ValidateBarrierFunctionCall.h",
-  "src/compiler/translator/ValidateClipCullDistance.cpp",
-  "src/compiler/translator/ValidateClipCullDistance.h",
   "src/compiler/translator/ValidateGlobalInitializer.cpp",
   "src/compiler/translator/ValidateGlobalInitializer.h",
-  "src/compiler/translator/ValidateLimitations.cpp",
-  "src/compiler/translator/ValidateLimitations.h",
-  "src/compiler/translator/ValidateMaxParameters.cpp",
-  "src/compiler/translator/ValidateMaxParameters.h",
   "src/compiler/translator/ValidateOutputs.cpp",
   "src/compiler/translator/ValidateOutputs.h",
   "src/compiler/translator/ValidateSwitch.cpp",
@@ -150,6 +144,8 @@ angle_translator_sources = [
   "src/compiler/translator/tree_ops/FoldExpressions.h",
   "src/compiler/translator/tree_ops/ForcePrecisionQualifier.cpp",
   "src/compiler/translator/tree_ops/ForcePrecisionQualifier.h",
+  "src/compiler/translator/tree_ops/GatherDefaultUniforms.cpp",
+  "src/compiler/translator/tree_ops/GatherDefaultUniforms.h",
   "src/compiler/translator/tree_ops/InitializeVariables.cpp",
   "src/compiler/translator/tree_ops/InitializeVariables.h",
   "src/compiler/translator/tree_ops/MonomorphizeUnsupportedFunctions.cpp",
@@ -445,6 +441,10 @@ angle_translator_lib_msl_sources = [
 ]
 
 angle_translator_lib_wgsl_sources = [
+  "src/compiler/translator/tree_ops/wgsl/RewriteMixedTypeMathExprs.cpp",
+  "src/compiler/translator/tree_ops/wgsl/RewriteMixedTypeMathExprs.h",
+  "src/compiler/translator/tree_ops/wgsl/RewriteMultielementSwizzleAssignment.cpp",
+  "src/compiler/translator/tree_ops/wgsl/RewriteMultielementSwizzleAssignment.h",
   "src/compiler/translator/wgsl/OutputUniformBlocks.cpp",
   "src/compiler/translator/wgsl/OutputUniformBlocks.h",
   "src/compiler/translator/wgsl/RewritePipelineVariables.cpp",
@@ -452,6 +452,8 @@ angle_translator_lib_wgsl_sources = [
   "src/compiler/translator/wgsl/TranslatorWGSL.cpp",
   "src/compiler/translator/wgsl/Utils.cpp",
   "src/compiler/translator/wgsl/Utils.h",
+  "src/compiler/translator/wgsl/WGSLProgramPrelude.cpp",
+  "src/compiler/translator/wgsl/WGSLProgramPrelude.h",
 ]
 
 angle_preprocessor_sources = [

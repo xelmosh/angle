@@ -4,6 +4,10 @@
 // found in the LICENSE file.
 //
 
+#ifdef UNSAFE_BUFFERS_BUILD
+#    pragma allow_unsafe_buffers
+#endif
+
 #include "compiler/translator/Compiler.h"
 
 #include <sstream>
@@ -21,10 +25,7 @@
 #include "compiler/translator/IsASTDepthBelowLimit.h"
 #include "compiler/translator/OutputTree.h"
 #include "compiler/translator/ParseContext.h"
-#include "compiler/translator/ValidateBarrierFunctionCall.h"
-#include "compiler/translator/ValidateClipCullDistance.h"
-#include "compiler/translator/ValidateLimitations.h"
-#include "compiler/translator/ValidateMaxParameters.h"
+#include "compiler/translator/SizeClipCullDistance.h"
 #include "compiler/translator/ValidateOutputs.h"
 #include "compiler/translator/ValidateTypeSizeLimitations.h"
 #include "compiler/translator/ValidateVaryingLocations.h"
@@ -61,7 +62,6 @@
 #include "compiler/translator/tree_ops/glsl/apple/AddAndTrueToLoopCondition.h"
 #include "compiler/translator/tree_ops/glsl/apple/UnfoldShortCircuitAST.h"
 #include "compiler/translator/tree_ops/msl/EnsureLoopForwardProgress.h"
-#include "compiler/translator/tree_util/BuiltIn.h"
 #include "compiler/translator/tree_util/FindSymbolNode.h"
 #include "compiler/translator/tree_util/IntermNodePatternMatcher.h"
 #include "compiler/translator/tree_util/ReplaceShadowingVariables.h"
@@ -236,35 +236,41 @@ struct UniformSortComparator
                                       ->getAsSymbolNode()
                                       ->variable()
                                       .getType();
-        // First, sort by precision: lowp and mediump are smaller than highp
-        if (firstType.getPrecision() != secondType.getPrecision())
-        {
-            return firstType.getPrecision() != TPrecision::EbpHigh;
-        }
-
-        // We don't sort highp uniforms. If both uniforms are highp, consider them as equivalent
-        if (firstType.getPrecision() == TPrecision::EbpHigh &&
-            secondType.getPrecision() == TPrecision::EbpHigh)
+        // If both uniforms are structs, do not reorder them
+        if (firstType.getStruct() != nullptr && secondType.getStruct() != nullptr)
         {
             return false;
         }
-        // If both uniforms are mediump or lowp, we further sort them based on a list of criteria
+
+        // Next sort by precisions
+        // Group uniforms into high-precision and non-high-precision. A non-highp uniform is
+        // considered "smaller" than a highp uniform.
+        const TPrecision firstPrecision  = firstType.getPrecision();
+        const TPrecision secondPrecision = secondType.getPrecision();
+        const bool firstIsHighP          = (firstPrecision == TPrecision::EbpHigh);
+        const bool secondIsHighP         = (secondPrecision == TPrecision::EbpHigh);
+        if (firstIsHighP != secondIsHighP)
+        {
+            return secondIsHighP;
+        }
+        // If both are highp, they are equivalent. Do not reorder them.
+        if (firstIsHighP)
+        {
+            return false;
+        }
+        // If we reach here, both uniforms are non-highp. We further sort them based on a list of
+        // criteria
         ASSERT(firstType.getPrecision() != TPrecision::EbpHigh &&
                secondType.getPrecision() != TPrecision::EbpHigh);
-        // criteria 1: sort by arrayness. Non-array element is smaller.
-        if (firstType.isArray() != secondType.isArray())
-        {
-            return !firstType.isArray();
-        }
-        // criteria 2: sort by whether the uniform is a struct. Non-structs is smaller.
+        // criteria 1: sort by whether the uniform is a struct. Non-structs is smaller.
         if ((firstType.getStruct() == nullptr) != (secondType.getStruct() == nullptr))
         {
             return firstType.getStruct() == nullptr;
         }
-        // If both are struct, place the one that has specifier in the front
-        if (firstType.getStruct() != nullptr && secondType.getStruct() != nullptr)
+        // criteria 2: sort by arrayness. Non-array element is smaller.
+        if (firstType.isArray() != secondType.isArray())
         {
-            return firstType.isStructSpecifier();
+            return !firstType.isArray();
         }
         // criteria 3, non-matrix is smaller than matrix
         if (firstType.isMatrix() != secondType.isMatrix())
@@ -376,23 +382,6 @@ int GetMaxUniformVectorsForShaderType(GLenum shaderType, const ShBuiltInResource
 namespace
 {
 
-class [[nodiscard]] TScopedPoolAllocator
-{
-  public:
-    TScopedPoolAllocator(angle::PoolAllocator *allocator) : mAllocator(allocator)
-    {
-        mAllocator->push();
-        SetGlobalPoolAllocator(mAllocator);
-    }
-    ~TScopedPoolAllocator()
-    {
-        SetGlobalPoolAllocator(nullptr);
-        mAllocator->pop(angle::PoolAllocator::ReleaseStrategy::All);
-    }
-
-  private:
-    angle::PoolAllocator *mAllocator;
-};
 
 class [[nodiscard]] TScopedSymbolTableLevel
 {
@@ -433,63 +422,16 @@ int GetMaxShaderVersionForSpec(ShShaderSpec spec)
     }
 }
 
-bool ValidateFragColorAndFragData(GLenum shaderType,
-                                  int shaderVersion,
-                                  const TSymbolTable &symbolTable,
-                                  TDiagnostics *diagnostics)
-{
-    if (shaderVersion > 100 || shaderType != GL_FRAGMENT_SHADER)
-    {
-        return true;
-    }
-
-    bool usesFragColor = false;
-    bool usesFragData  = false;
-    // This validation is a bit stricter than the spec - it's only an error to write to
-    // both FragData and FragColor. But because it's better not to have reads from undefined
-    // variables, we always return an error if they are both referenced, rather than only if they
-    // are written.
-    if (symbolTable.isStaticallyUsed(*BuiltInVariable::gl_FragColor()) ||
-        symbolTable.isStaticallyUsed(*BuiltInVariable::gl_SecondaryFragColorEXT()))
-    {
-        usesFragColor = true;
-    }
-    // Extension variables may not always be initialized (saves some time at symbol table init).
-    bool secondaryFragDataUsed =
-        symbolTable.gl_SecondaryFragDataEXT() != nullptr &&
-        symbolTable.isStaticallyUsed(*symbolTable.gl_SecondaryFragDataEXT());
-    if (symbolTable.isStaticallyUsed(*symbolTable.gl_FragData()) || secondaryFragDataUsed)
-    {
-        usesFragData = true;
-    }
-    if (usesFragColor && usesFragData)
-    {
-        const char *errorMessage = "cannot use both gl_FragData and gl_FragColor";
-        if (symbolTable.isStaticallyUsed(*BuiltInVariable::gl_SecondaryFragColorEXT()) ||
-            secondaryFragDataUsed)
-        {
-            errorMessage =
-                "cannot use both output variable sets (gl_FragData, gl_SecondaryFragDataEXT)"
-                " and (gl_FragColor, gl_SecondaryFragColorEXT)";
-        }
-        diagnostics->globalError(errorMessage);
-        return false;
-    }
-    return true;
-}
-
 }  // namespace
 
 TShHandleBase::TShHandleBase()
 {
-    allocator.push();
     SetGlobalPoolAllocator(&allocator);
 }
 
 TShHandleBase::~TShHandleBase()
 {
     SetGlobalPoolAllocator(nullptr);
-    allocator.popAll();
 }
 
 TCompiler::TCompiler(sh::GLenum type, ShShaderSpec spec, ShShaderOutput output)
@@ -631,7 +573,7 @@ TIntermBlock *TCompiler::compileTreeImpl(const char *const shaderStrings[],
         return nullptr;
     }
 
-    if (!postParseChecks(parseContext))
+    if (!parseContext.postParseChecks())
     {
         return nullptr;
     }
@@ -644,9 +586,16 @@ TIntermBlock *TCompiler::compileTreeImpl(const char *const shaderStrings[],
     }
 
     TIntermBlock *root = parseContext.getTreeRoot();
-    if (!checkAndSimplifyAST(root, parseContext, compileOptions))
+    if (compileOptions.skipAllValidationAndTransforms)
     {
-        return nullptr;
+        collectVariables(root);
+    }
+    else
+    {
+        if (!checkAndSimplifyAST(root, parseContext, compileOptions))
+        {
+            return nullptr;
+        }
     }
 
     return root;
@@ -817,7 +766,10 @@ bool TCompiler::getShaderBinary(const ShHandle compilerHandle,
     gl::BinaryOutputStream stream;
     gl::ShaderType shaderType = gl::FromGLenum<gl::ShaderType>(mShaderType);
     gl::CompiledShaderState state(shaderType);
-    state.buildCompiledShaderState(compilerHandle, IsOutputSPIRV(mOutputType));
+    state.buildCompiledShaderState(
+        compilerHandle,
+        gl::JoinShaderSources(static_cast<GLsizei>(numStrings), shaderStrings, nullptr),
+        mOutputType);
 
     stream.writeBytes(
         reinterpret_cast<const unsigned char *>(angle::GetANGLEShaderProgramVersion()),
@@ -929,35 +881,6 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         }
     }
 
-    // For now, rewrite pixel local storage before collecting variables or any operations on images.
-    //
-    // TODO(anglebug.com/40096838):
-    //   Should this actually run after collecting variables?
-    //   Do we need more introspection?
-    //   Do we want to hide rewritten shader image uniforms from glGetActiveUniform?
-    if (hasPixelLocalStorageUniforms())
-    {
-        ASSERT(
-            IsExtensionEnabled(mExtensionBehavior, TExtension::ANGLE_shader_pixel_local_storage));
-        if (!RewritePixelLocalStorage(this, root, getSymbolTable(), compileOptions,
-                                      getShaderVersion()))
-        {
-            mDiagnostics.globalError("internal compiler error translating pixel local storage");
-            return false;
-        }
-    }
-
-    if (shouldRunLoopAndIndexingValidation(compileOptions) &&
-        !ValidateLimitations(root, mShaderType, &mSymbolTable, &mDiagnostics))
-    {
-        return false;
-    }
-
-    if (!ValidateFragColorAndFragData(mShaderType, mShaderVersion, mSymbolTable, &mDiagnostics))
-    {
-        return false;
-    }
-
     // Fold expressions that could not be folded before validation that was done as a part of
     // parsing.
     if (!FoldExpressions(this, root, &mDiagnostics))
@@ -967,29 +890,32 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
     // Folding should only be able to generate warnings.
     ASSERT(mDiagnostics.numErrors() == 0);
 
-    // gl_ClipDistance and gl_CullDistance built-in arrays have unique semantics.
-    // They are pre-declared as unsized and must be sized by the shader either
-    // redeclaring them or indexing them only with integral constant expressions.
-    // The translator treats them as having the maximum allowed size and this pass
-    // detects the actual sizes resizing the variables if needed.
     if (parseContext.isExtensionEnabled(TExtension::ANGLE_clip_cull_distance) ||
         parseContext.isExtensionEnabled(TExtension::EXT_clip_cull_distance) ||
         parseContext.isExtensionEnabled(TExtension::APPLE_clip_distance))
     {
-        bool isClipDistanceUsed = false;
-        if (!ValidateClipCullDistance(this, root, &mDiagnostics,
-                                      mResources.MaxCombinedClipAndCullDistances,
-                                      &mClipDistanceSize, &mCullDistanceSize, &isClipDistanceUsed))
+        mClipDistanceSize = static_cast<uint8_t>(parseContext.getClipDistanceArraySize());
+        mCullDistanceSize = static_cast<uint8_t>(parseContext.getCullDistanceArraySize());
+        mMetadataFlags[MetadataFlags::HasClipDistance] = parseContext.isClipDistanceUsed();
+
+        // gl_ClipDistance and gl_CullDistance built-in arrays have unique semantics.
+        // They are pre-declared as unsized and must be sized by the shader either
+        // redeclaring them or indexing them only with integral constant expressions.
+        // The translator treats them as having the maximum allowed size and this pass
+        // applies the actual sizes if needed.
+        if (mClipDistanceSize > 0 && !parseContext.isClipDistanceRedeclared() &&
+            !SizeClipCullDistance(this, root, ImmutableString("gl_ClipDistance"),
+                                  mClipDistanceSize))
+        {
+
+            return false;
+        }
+        if (mCullDistanceSize > 0 && !parseContext.isCullDistanceRedeclared() &&
+            !SizeClipCullDistance(this, root, ImmutableString("gl_CullDistance"),
+                                  mCullDistanceSize))
         {
             return false;
         }
-        mMetadataFlags[MetadataFlags::HasClipDistance] = isClipDistanceUsed;
-    }
-
-    // Validate no barrier() after return before prunning it in |PruneNoOps()| below.
-    if (mShaderType == GL_TESS_CONTROL_SHADER && !ValidateBarrierFunctionCall(root, &mDiagnostics))
-    {
-        return false;
     }
 
     // We prune no-ops to work around driver bugs and to keep AST processing and output simple.
@@ -1046,13 +972,10 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         return false;
     }
 
-    // Checks which functions are used and if "main" exists
+    // Checks which functions are used
     mFunctionMetadata.clear();
     mFunctionMetadata.resize(mCallDag.size());
-    if (!tagUsedFunctions())
-    {
-        return false;
-    }
+    tagUsedFunctions();
 
     if (!pruneUnusedFunctions(root))
     {
@@ -1088,7 +1011,24 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         return false;
     }
 
-    // Clamping uniform array bounds needs to happen after validateLimitations pass.
+    // For now, rewrite pixel local storage before collecting variables or any operations on images.
+    //
+    // TODO(anglebug.com/40096838):
+    //   Should this actually run after collecting variables?
+    //   Do we need more introspection?
+    //   Do we want to hide rewritten shader image uniforms from glGetActiveUniform?
+    if (hasPixelLocalStorageUniforms())
+    {
+        ASSERT(
+            IsExtensionEnabled(mExtensionBehavior, TExtension::ANGLE_shader_pixel_local_storage));
+        if (!RewritePixelLocalStorage(this, root, getSymbolTable(), compileOptions,
+                                      getShaderVersion()))
+        {
+            mDiagnostics.globalError("internal compiler error translating pixel local storage");
+            return false;
+        }
+    }
+
     if (compileOptions.clampIndirectArrayBounds)
     {
         if (!ClampIndirectIndices(this, root, &mSymbolTable))
@@ -1131,6 +1071,17 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         {
             return false;
         }
+    }
+
+    // https://crbug.com/437678149:
+    // On Mac, if ANGLE internal uniforms are not placed on the top of ANGLE_UserUniforms struct,
+    // the other user-defined uniforms are not intercepted correctly by the shader code.
+    // Sort user-defined uniforms first before adding ANGLE internal uniforms like
+    // angle_DrawID on top of them, so that the sort doesn't reorder the ANGLE internal uniforms
+    // and trigger the bug on Mac.
+    if (!sortUniforms(root))
+    {
+        return false;
     }
 
     if (mShaderType == GL_VERTEX_SHADER &&
@@ -1274,7 +1225,6 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         return false;
     }
 
-    // Built-in function emulation needs to happen after validateLimitations pass.
     GetGlobalPoolAllocator()->lock();
     initBuiltInFunctionEmulator(&mBuiltInFunctionEmulator, compileOptions);
     GetGlobalPoolAllocator()->unlock();
@@ -1296,17 +1246,8 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
         }
     }
 
-    ASSERT(!mVariablesCollected);
-    if (!sortUniforms(root))
-    {
-        return false;
-    }
-    CollectVariables(root, &mAttributes, &mOutputVariables, &mUniforms, &mInputVaryings,
-                     &mOutputVaryings, &mSharedVariables, &mUniformBlocks, &mShaderStorageBlocks,
-                     mResources.HashFunction, &mSymbolTable, mShaderType, mExtensionBehavior,
-                     mResources, mTessControlShaderOutputVertices);
-    collectInterfaceBlocks();
-    mVariablesCollected = true;
+    collectVariables(root);
+
     if (compileOptions.useUnusedStandardSharedBlocks)
     {
         if (!useAllMembersInUnusedStandardAndSharedBlocks(root))
@@ -1461,29 +1402,6 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
     return true;
 }
 
-bool TCompiler::postParseChecks(const TParseContext &parseContext)
-{
-    std::stringstream errorMessage;
-
-    if (parseContext.getTreeRoot() == nullptr)
-    {
-        errorMessage << "Shader parsing failed (mTreeRoot == nullptr)";
-    }
-
-    for (TType *type : parseContext.getDeferredArrayTypesToSize())
-    {
-        errorMessage << "Unsized global array type: " << type->getBasicString();
-    }
-
-    if (!errorMessage.str().empty())
-    {
-        mDiagnostics.globalError(errorMessage.str().c_str());
-        return false;
-    }
-
-    return true;
-}
-
 bool TCompiler::compile(const char *const shaderStrings[],
                         size_t numStrings,
                         const ShCompileOptions &compileOptionsIn)
@@ -1505,7 +1423,7 @@ bool TCompiler::compile(const char *const shaderStrings[],
         compileOptions.flattenPragmaSTDGLInvariantAll = true;
     }
 
-    TScopedPoolAllocator scopedAlloc(&allocator);
+    TScopedPoolAllocator scopedAlloc;
     TIntermBlock *root = compileTreeImpl(shaderStrings, numStrings, compileOptions);
 
     if (root)
@@ -1594,6 +1512,10 @@ void TCompiler::setResourceString()
         << ":MaxTextureImageUnits:" << mResources.MaxTextureImageUnits
         << ":MaxFragmentUniformVectors:" << mResources.MaxFragmentUniformVectors
         << ":MaxDrawBuffers:" << mResources.MaxDrawBuffers
+        << ":ShadingRateFlag2VerticalPixelsEXT:" << mResources.ShadingRateFlag2VerticalPixelsEXT
+        << ":ShadingRateFlag2VerticalPixelsEXT:" << mResources.ShadingRateFlag2VerticalPixelsEXT
+        << ":ShadingRateFlag2HorizontalPixelsEXT:" << mResources.ShadingRateFlag2HorizontalPixelsEXT
+        << ":ShadingRateFlag4HorizontalPixelsEXT:" << mResources.ShadingRateFlag4HorizontalPixelsEXT
         << ":OES_standard_derivatives:" << mResources.OES_standard_derivatives
         << ":OES_EGL_image_external:" << mResources.OES_EGL_image_external
         << ":OES_EGL_image_external_essl3:" << mResources.OES_EGL_image_external_essl3
@@ -1614,7 +1536,6 @@ void TCompiler::setResourceString()
         << ":EXT_shader_texture_lod:" << mResources.EXT_shader_texture_lod
         << ":EXT_shader_framebuffer_fetch:" << mResources.EXT_shader_framebuffer_fetch
         << ":EXT_shader_framebuffer_fetch_non_coherent:" << mResources.EXT_shader_framebuffer_fetch_non_coherent
-        << ":NV_shader_framebuffer_fetch:" << mResources.NV_shader_framebuffer_fetch
         << ":ARM_shader_framebuffer_fetch:" << mResources.ARM_shader_framebuffer_fetch
         << ":ARM_shader_framebuffer_fetch_depth_stencil:" << mResources.ARM_shader_framebuffer_fetch_depth_stencil
         << ":OVR_multiview2:" << mResources.OVR_multiview2
@@ -1647,6 +1568,8 @@ void TCompiler::setResourceString()
         << ":OES_tessellation_shader:" << mResources.OES_tessellation_shader
         << ":OES_texture_buffer:" << mResources.OES_texture_buffer
         << ":EXT_texture_buffer:" << mResources.EXT_texture_buffer
+        << ":EXT_fragment_shading_rate:" << mResources.EXT_fragment_shading_rate
+        << ":EXT_fragment_shading_rate_primitive:" << mResources.EXT_fragment_shading_rate_primitive
         << ":OES_sample_variables:" << mResources.OES_sample_variables
         << ":EXT_clip_cull_distance:" << mResources.EXT_clip_cull_distance
         << ":ANGLE_clip_cull_distance:" << mResources.ANGLE_clip_cull_distance
@@ -1713,6 +1636,18 @@ void TCompiler::setResourceString()
     // clang-format on
 
     mBuiltInResourcesString = strstream.str();
+}
+
+void TCompiler::collectVariables(TIntermBlock *root)
+{
+    ASSERT(!mVariablesCollected);
+    CollectVariables(root, &mAttributes, &mOutputVariables, &mUniforms, &mInputVaryings,
+                     &mOutputVaryings, &mSharedVariables, &mUniformBlocks, &mShaderStorageBlocks,
+                     mResources.UserVariableNamePrefix, mResources.HashFunction, &mSymbolTable,
+                     mShaderType, mExtensionBehavior, mResources, mTessControlShaderOutputVertices,
+                     mCompileOptions.transformFloatUniformTo16Bits);
+    collectInterfaceBlocks();
+    mVariablesCollected = true;
 }
 
 void TCompiler::collectInterfaceBlocks()
@@ -1846,20 +1781,18 @@ bool TCompiler::checkCallDepth()
     return true;
 }
 
-bool TCompiler::tagUsedFunctions()
+void TCompiler::tagUsedFunctions()
 {
-    // Search from main, starting from the end of the DAG as it usually is the root.
+    // Search from main, starting from the end of the DAG as it's usually found at the end of the
+    // shader.
     for (size_t i = mCallDag.size(); i-- > 0;)
     {
         if (mCallDag.getRecordFromIndex(i).node->getFunction()->isMain())
         {
             internalTagUsedFunction(i);
-            return true;
+            break;
         }
     }
-
-    mDiagnostics.globalError("Missing main()");
-    return false;
 }
 
 void TCompiler::internalTagUsedFunction(size_t index)
@@ -1974,12 +1907,6 @@ bool TCompiler::limitExpressionComplexity(TIntermBlock *root)
     if (!IsASTDepthBelowLimit(root, mResources.MaxExpressionComplexity))
     {
         mDiagnostics.globalError("Expression too complex.");
-        return false;
-    }
-
-    if (!ValidateMaxParameters(root, mResources.MaxFunctionParameters))
-    {
-        mDiagnostics.globalError("Function has too many parameters.");
         return false;
     }
 

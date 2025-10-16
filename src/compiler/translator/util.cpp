@@ -4,6 +4,10 @@
 // found in the LICENSE file.
 //
 
+#ifdef UNSAFE_BUFFERS_BUILD
+#    pragma allow_unsafe_buffers
+#endif
+
 #include "compiler/translator/util.h"
 
 #include <limits>
@@ -477,10 +481,13 @@ ImmutableString ArrayString(const TType &type)
     return arrayString;
 }
 
-ImmutableString GetTypeName(const TType &type, ShHashFunction64 hashFunction, NameMap *nameMap)
+ImmutableString GetTypeName(const TType &type,
+                            char prefix,
+                            ShHashFunction64 hashFunction,
+                            NameMap *nameMap)
 {
     if (type.getBasicType() == EbtStruct)
-        return HashName(type.getStruct(), hashFunction, nameMap);
+        return HashName(type.getStruct(), prefix, hashFunction, nameMap);
     else
         return ImmutableString(type.getBuiltInTypeNameString());
 }
@@ -933,7 +940,8 @@ bool IsRedeclarableBuiltIn(const ImmutableString &name)
     return name == "gl_ClipDistance" || name == "gl_CullDistance" || name == "gl_FragDepth" ||
            name == "gl_LastFragData" || name == "gl_LastFragColorARM" ||
            name == "gl_LastFragDepthARM" || name == "gl_LastFragStencilARM" ||
-           name == "gl_PerVertex" || name == "gl_Position" || name == "gl_PointSize";
+           name == "gl_PerVertex" || name == "gl_in" || name == "gl_out" || name == "gl_Position" ||
+           name == "gl_PointSize";
 }
 
 size_t FindFieldIndex(const TFieldList &fieldList, const char *fieldName)
